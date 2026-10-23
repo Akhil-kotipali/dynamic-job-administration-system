@@ -56,21 +56,19 @@ This project implements and measures concrete engineering solutions for each of 
 
 ```mermaid
 flowchart TD
-    Client[HTTP Client / Producer] -->|POST /jobs| API[Spring Boot REST Controller]
-    API -->|Save with status: WAITING| DB[(MySQL 8\njob_queue_table)]
-    API -.->|Notify| Signal[Thread Monitor Notify]
+    Client["HTTP Client / Producer"] -->|"POST /jobs"| API["Spring Boot REST Controller"]
+    API -->|"Save status: WAITING"| DB[("MySQL 8 Database<br/>job_queue_table")]
+    API -.->|"notifyWorkers()"| Signal["Thread Monitor Signal"]
 
-    subgraph "Leader Daemon (Scheduled)"
-        Leader[Leader Service] -->|Every 1s| Wake[Notify Workers]
-        Leader -->|Every 5s| Recov[Recover Expired Leases]
-        Leader -->|Every 2s| Monitor[Check Waiting Queue]
+    subgraph LeaderDaemon ["Leader Daemon (Scheduled)"]
+        Leader["Leader Scheduler"] -->|"Every 1s / 2s"| Wake["Poll and Notify"]
+        Leader -->|"Every 5s"| Recov["Recover Expired Leases"]
     end
 
-    Recov -->|Scan RUNNING & lease <= NOW| DB
-    Wake -.-> Signal
-    Monitor -.-> Signal
+    Recov -->|"Re-queue Expired RUNNING Jobs"| DB
+    Wake -.->|"notifyAll()"| Signal
 
-    subgraph "Worker Thread Pool (6 Workers)"
+    subgraph WorkerPool ["Worker Pool (6 Threads)"]
         H1["Worker H1 (Dedicated HIGH)"]
         H2["Worker H2 (Flexible HIGH)"]
         H3["Worker H3 (Flexible HIGH)"]
@@ -79,10 +77,22 @@ flowchart TD
         L1["Worker L1 (Flexible LOW)"]
     end
 
-    Signal -.->|Wake up| H1 & H2 & H3 & M1 & M2 & L1
+    Signal -.->|"Wakeup"| H1
+    Signal -.->|"Wakeup"| H2
+    Signal -.->|"Wakeup"| H3
+    Signal -.->|"Wakeup"| M1
+    Signal -.->|"Wakeup"| M2
+    Signal -.->|"Wakeup"| L1
 
-    H1 & H2 & H3 & M1 & M2 & L1 -->|Pessimistic Write + SKIP LOCKED| ClaimService[Job Claim Service]
-    ClaimService <-->|Atomic Claim & Increment Attempt| DB
+    H1 -->|"SKIP LOCKED"| ClaimService["Job Claim Service"]
+    H2 -->|"SKIP LOCKED"| ClaimService
+    H3 -->|"SKIP LOCKED"| ClaimService
+    M1 -->|"SKIP LOCKED"| ClaimService
+    M2 -->|"SKIP LOCKED"| ClaimService
+    L1 -->|"SKIP LOCKED"| ClaimService
+
+    ClaimService -->|"Atomic Claim and Attempt Increment"| DB
+    DB -->|"Return Locked Row"| ClaimService
 ```
 
 ---
@@ -109,15 +119,10 @@ The engine operates **six background worker threads**. Rather than using a naive
 ```mermaid
 stateDiagram-v2
     [*] --> WAITING : Job Submitted (POST /jobs)
-    
-    WAITING --> RUNNING : Worker Claims Job\n(Increments Attempt Token,\nSets Lease Expiry)
-    
-    RUNNING --> COMPLETED : Execution Finishes\n(Valid Token + Lease Active)
-    
-    RUNNING --> WAITING : Lease Expired & Attempts < Max\n(Recovered by Leader)
-    
-    RUNNING --> FAILED : Lease Expired & Attempts >= Max\n(Retry Limit Exhausted)
-    
+    WAITING --> RUNNING : Worker Claims Job (Token + 1, Lease Set)
+    RUNNING --> COMPLETED : Execution Finishes (Valid Token and Active Lease)
+    RUNNING --> WAITING : Lease Expired (Attempts below Max)
+    RUNNING --> FAILED : Lease Expired (Max Attempts reached)
     COMPLETED --> [*]
     FAILED --> [*]
 ```
@@ -158,7 +163,9 @@ Optional<JobQueue> findFirstByPriorityAndCurrentStatusOrderByCreatedAtAsc(
 
 ### 2. Lease-Based Crash Recovery
 Every claim assigns an expiration lease:
-$$\text{leaseExpiresAt} = \text{now} + \text{workDurationMs} + 10{,}000\text{ ms (grace period)}$$
+```text
+leaseExpiresAt = now + workDurationMs + 10,000 ms (grace period)
+```
 
 If a worker node crashes, experiences an unhandled exception, or suffers a network partition, the scheduled leader daemon detects the expired lease:
 ```java
